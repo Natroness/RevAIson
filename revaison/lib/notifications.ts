@@ -1,4 +1,4 @@
-import type { ReviewWithTopic } from "@/types";
+import type { ReviewItem } from "@/types";
 
 export function isNotificationSupported(): boolean {
   return (
@@ -20,28 +20,25 @@ export async function requestNotificationPermission(): Promise<NotificationPermi
   }
 }
 
-const shownReviewIds = new Set<string>();
+const shownItemIds = new Set<string>();
 
-export function showReviewNotification(review: ReviewWithTopic): void {
+export function showReviewNotification(item: ReviewItem): void {
   if (!isNotificationSupported()) return;
   if (Notification.permission !== "granted") return;
-  if (shownReviewIds.has(review.id)) return;
-
-  const title = review.topic?.title ?? "Review due";
-  const body = `It's time to review (${review.interval_label}).`;
+  if (shownItemIds.has(item.id)) return;
 
   try {
-    new Notification(`RevAIson: ${title}`, {
-      body,
-      tag: `review-${review.id}`,
+    new Notification(`RevAIson: ${item.title}`, {
+      body: "This item is due for review.",
+      tag: `review-${item.id}`,
       icon: "/favicon.ico",
     });
-    shownReviewIds.add(review.id);
+    shownItemIds.add(item.id);
   } catch {
     // Some browsers throw when invoked outside of a user gesture; ignore.
   }
 }
 
 export function resetNotificationCache(): void {
-  shownReviewIds.clear();
+  shownItemIds.clear();
 }

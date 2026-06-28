@@ -5,8 +5,6 @@ import { useRouter } from "next/navigation";
 import { format } from "date-fns";
 import { getCurrentUser } from "@/lib/authService";
 import { createTopic } from "@/lib/topicService";
-import { generateReviewSchedule } from "@/lib/reviewSchedule";
-import { createReviews } from "@/lib/reviewService";
 
 function defaultStudiedAtValue(): string {
   return format(new Date(), "yyyy-MM-dd'T'HH:mm");
@@ -53,17 +51,6 @@ export default function TopicForm() {
       );
       if (topicRes.error || !topicRes.data) {
         setError(topicRes.error ?? "Could not create topic");
-        return;
-      }
-
-      const schedule = generateReviewSchedule(studiedDate);
-      const reviewsRes = await createReviews(
-        userId,
-        topicRes.data.id,
-        schedule,
-      );
-      if (reviewsRes.error) {
-        setError(reviewsRes.error);
         return;
       }
 
@@ -136,7 +123,8 @@ export default function TopicForm() {
           className="w-full rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 shadow-sm focus:border-zinc-900 focus:outline-none focus:ring-2 focus:ring-zinc-900/20 dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-100 dark:focus:border-zinc-300 dark:focus:ring-zinc-300/20"
         />
         <p className="text-xs text-zinc-500 dark:text-zinc-400">
-          Reviews are scheduled at 1h, 8h, 1d, 1w, and 1mo after this time.
+          The topic becomes due for its first review at this time. Each review
+          you rate adaptively schedules the next one.
         </p>
       </div>
 

@@ -3,18 +3,29 @@
 import { use, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { format, isPast } from "date-fns";
+import { format, formatDistanceToNowStrict } from "date-fns";
 import Navbar from "@/components/Navbar";
+import NotesEditor from "@/components/NotesEditor";
+import AdaptiveReviewControls from "@/components/AdaptiveReviewControls";
 import { getCurrentUser } from "@/lib/authService";
-import { getTopicById, deleteTopic } from "@/lib/topicService";
 import {
-  getReviewsForTopic,
-  markReviewCompleted,
-} from "@/lib/reviewService";
-import type { Review, Topic } from "@/types";
+  getTopicById,
+  deleteTopic,
+  updateTopicNotes,
+} from "@/lib/topicService";
+import { completeAdaptiveReview } from "@/lib/reviewService";
+import type { ItemStatus, Rating, Topic } from "@/types";
 
 const UUID_REGEX =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+const STATUS_BADGE: Record<ItemStatus, string> = {
+  not_started: "bg-zinc-100 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-200",
+  learning: "bg-amber-100 text-amber-800 dark:bg-amber-950/50 dark:text-amber-300",
+  weak: "bg-rose-100 text-rose-800 dark:bg-rose-950/50 dark:text-rose-300",
+  mastered:
+    "bg-emerald-100 text-emerald-800 dark:bg-emerald-950/50 dark:text-emerald-300",
+};
 
 interface TopicDetailPageProps {
   params: Promise<{ id: string }>;
@@ -24,10 +35,8 @@ export default function TopicDetailPage({ params }: TopicDetailPageProps) {
   const { id } = use(params);
   const router = useRouter();
   const [topic, setTopic] = useState<Topic | null>(null);
-  const [reviews, setReviews] = useState<Review[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [marking, setMarking] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
 
   useEffect(() => {
@@ -44,27 +53,13 @@ export default function TopicDetailPage({ params }: TopicDetailPageProps) {
         router.replace("/login");
         return;
       }
-      const uid = userRes.data.id;
-
-      const [topicRes, reviewsRes] = await Promise.all([
-        getTopicById(uid, id),
-        getReviewsForTopic(uid, id),
-      ]);
+      const topicRes = await getTopicById(userRes.data.id, id);
       if (!active) return;
-
       if (topicRes.error || !topicRes.data) {
         setError(topicRes.error ?? "Topic not found");
-        setLoading(false);
-        return;
+      } else {
+        setTopic(topicRes.data);
       }
-      if (reviewsRes.error) {
-        setError(reviewsRes.error);
-        setLoading(false);
-        return;
-      }
-
-      setTopic(topicRes.data);
-      setReviews(reviewsRes.data ?? []);
       setLoading(false);
     })();
     return () => {
@@ -72,37 +67,52 @@ export default function TopicDetailPage({ params }: TopicDetailPageProps) {
     };
   }, [id, router]);
 
-  async function handleMarkComplete(reviewId: string) {
+  async function handleRate(rating: Rating) {
     if (!topic) return;
-    setMarking(reviewId);
-    const { error: serviceError } = await markReviewCompleted(
+    const { data, error: e } = await completeAdaptiveReview(
       topic.user_id,
-      reviewId,
+      "topic",
+      topic.id,
+      rating,
     );
-    setMarking(null);
-    if (serviceError) {
-      setError(serviceError);
+    if (e || !data) {
+      setError(e ?? "Could not save review");
       return;
     }
-    setReviews((prev) =>
-      prev.map((r) =>
-        r.id === reviewId
-          ? { ...r, completed: true, completed_at: new Date().toISOString() }
-          : r,
-      ),
+    setTopic((prev) =>
+      prev
+        ? {
+            ...prev,
+            next_review_at: data.next_review_at,
+            last_reviewed_at: new Date().toISOString(),
+            attempt_count: data.attempt_count,
+            status: data.status,
+          }
+        : prev,
     );
+  }
+
+  async function handleSaveNotes(notes: string) {
+    if (!topic) return;
+    const { data, error: e } = await updateTopicNotes(
+      topic.user_id,
+      topic.id,
+      notes,
+    );
+    if (e || !data) throw new Error(e ?? "Could not save notes");
+    setTopic((prev) => (prev ? { ...prev, notes: data.notes } : prev));
   }
 
   async function handleDelete() {
     if (!topic || deleting) return;
     const confirmed = window.confirm(
-      "Delete this topic and all its reviews? This cannot be undone.",
+      "Delete this topic and its review history? This cannot be undone.",
     );
     if (!confirmed) return;
     setDeleting(true);
-    const { error: serviceError } = await deleteTopic(topic.user_id, topic.id);
-    if (serviceError) {
-      setError(serviceError);
+    const { error: e } = await deleteTopic(topic.user_id, topic.id);
+    if (e) {
+      setError(e);
       setDeleting(false);
       return;
     }
@@ -134,83 +144,42 @@ export default function TopicDetailPage({ params }: TopicDetailPageProps) {
         ) : (
           <article className="space-y-8">
             <header className="space-y-2">
-              <p className="text-xs uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
-                Topic
-              </p>
+              <div className="flex items-center gap-2">
+                <span
+                  className={`rounded-full px-2.5 py-1 text-xs font-medium capitalize ${STATUS_BADGE[topic.status ?? "learning"]}`}
+                >
+                  {(topic.status ?? "learning").replace("_", " ")}
+                </span>
+                <span className="text-xs text-zinc-500 dark:text-zinc-400">
+                  {topic.attempt_count ?? 0} attempt
+                  {(topic.attempt_count ?? 0) === 1 ? "" : "s"}
+                </span>
+              </div>
               <h1 className="text-3xl font-semibold tracking-tight">
                 {topic.title}
               </h1>
               <p className="text-sm text-zinc-500 dark:text-zinc-400">
                 Studied {format(new Date(topic.studied_at), "PPpp")}
+                {topic.next_review_at
+                  ? ` · Next review ${formatDistanceToNowStrict(new Date(topic.next_review_at), { addSuffix: true })}`
+                  : ""}
               </p>
             </header>
 
-            {topic.notes ? (
-              <section className="rounded-xl border border-zinc-200 bg-white p-5 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
-                <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">
-                  Notes
-                </h2>
-                <p className="mt-2 whitespace-pre-wrap text-sm text-zinc-700 dark:text-zinc-200">
-                  {topic.notes}
-                </p>
-              </section>
-            ) : null}
-
-            <section className="space-y-3">
-              <h2 className="text-lg font-semibold text-zinc-900 dark:text-zinc-50">
-                Review schedule
+            <section className="space-y-3 rounded-xl border border-zinc-200 bg-white p-5 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
+              <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">
+                Review this topic
               </h2>
-              <ul className="divide-y divide-zinc-200 overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-sm dark:divide-zinc-800 dark:border-zinc-800 dark:bg-zinc-900">
-                {reviews.map((review) => {
-                  const due = isPast(new Date(review.review_time));
-                  return (
-                    <li
-                      key={review.id}
-                      className="flex flex-wrap items-center justify-between gap-3 p-4"
-                    >
-                      <div>
-                        <p className="text-sm font-medium text-zinc-900 dark:text-zinc-50">
-                          {review.interval_label}
-                        </p>
-                        <p className="text-xs text-zinc-500 dark:text-zinc-400">
-                          {format(new Date(review.review_time), "PPpp")}
-                          {review.completed && review.completed_at
-                            ? ` · Completed ${format(new Date(review.completed_at), "PPpp")}`
-                            : ""}
-                        </p>
-                      </div>
-                      {review.completed ? (
-                        <span className="rounded-full bg-emerald-100 px-2.5 py-1 text-xs font-medium text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-300">
-                          Completed
-                        </span>
-                      ) : (
-                        <button
-                          type="button"
-                          onClick={() => handleMarkComplete(review.id)}
-                          disabled={marking === review.id}
-                          className={`rounded-md px-3 py-1.5 text-xs font-medium transition disabled:opacity-50 ${
-                            due
-                              ? "bg-zinc-900 text-white hover:bg-zinc-800 dark:bg-zinc-50 dark:text-zinc-900 dark:hover:bg-zinc-200"
-                              : "border border-zinc-300 text-zinc-700 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-800"
-                          }`}
-                        >
-                          {marking === review.id
-                            ? "Marking…"
-                            : due
-                              ? "Mark complete"
-                              : "Complete early"}
-                        </button>
-                      )}
-                    </li>
-                  );
-                })}
-                {reviews.length === 0 ? (
-                  <li className="p-4 text-sm text-zinc-500 dark:text-zinc-400">
-                    No reviews scheduled for this topic.
-                  </li>
-                ) : null}
-              </ul>
+              <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                How well did you recall it? Your rating sets the next review.
+              </p>
+              <AdaptiveReviewControls onRate={handleRate} />
             </section>
+
+            <NotesEditor
+              initialNotes={topic.notes}
+              onSave={handleSaveNotes}
+            />
 
             <section className="flex flex-wrap gap-3">
               <Link

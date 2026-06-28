@@ -2,7 +2,7 @@ import { supabase } from "./supabaseClient";
 import type { ServiceResult, Topic } from "@/types";
 
 const TITLE_MAX_LENGTH = 200;
-const NOTES_MAX_LENGTH = 5000;
+const NOTES_MAX_LENGTH = 20000;
 
 function sanitize(value: string | null | undefined, max: number): string {
   if (value == null) return "";
@@ -14,6 +14,10 @@ function requireUserId(userId: string | null | undefined): string | null {
   return null;
 }
 
+/**
+ * Create one adaptive study item. No future review rows are generated — the
+ * item simply becomes due for its first review at `studiedAt`.
+ */
 export async function createTopic(
   userId: string,
   title: string,
@@ -39,6 +43,10 @@ export async function createTopic(
       title: cleanTitle,
       notes: cleanNotes,
       studied_at: studiedAt.toISOString(),
+      status: "learning",
+      difficulty: "medium",
+      next_review_at: studiedAt.toISOString(),
+      attempt_count: 0,
     })
     .select("*")
     .single();
@@ -80,6 +88,30 @@ export async function getTopicById(
 
   if (error) return { data: null, error: error.message };
   if (!data) return { data: null, error: "Topic not found" };
+  return { data: data as Topic, error: null };
+}
+
+/** Permanent notes: editable at any time, including after mastery. */
+export async function updateTopicNotes(
+  userId: string,
+  topicId: string,
+  notes: string,
+): Promise<ServiceResult<Topic>> {
+  const idError = requireUserId(userId);
+  if (idError) return { data: null, error: idError };
+  if (!topicId) return { data: null, error: "Missing topic id" };
+
+  const cleanNotes = sanitize(notes, NOTES_MAX_LENGTH) || null;
+
+  const { data, error } = await supabase
+    .from("topics")
+    .update({ notes: cleanNotes })
+    .eq("user_id", userId)
+    .eq("id", topicId)
+    .select("*")
+    .single();
+
+  if (error) return { data: null, error: error.message };
   return { data: data as Topic, error: null };
 }
 

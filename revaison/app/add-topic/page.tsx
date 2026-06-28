@@ -46,8 +46,8 @@ export default function AddTopicPage() {
             Add a topic
           </h1>
           <p className="text-sm text-zinc-500 dark:text-zinc-400">
-            We&apos;ll schedule reviews at 1h, 8h, 1d, 1w, and 1mo from your
-            study time.
+            We&apos;ll make it due for review, then adapt each next review to
+            how well you recall it.
           </p>
         </header>
         <TopicForm />

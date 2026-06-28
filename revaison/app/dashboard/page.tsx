@@ -2,74 +2,94 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
+import Link from "next/link";
 import Navbar from "@/components/Navbar";
 import ReviewList from "@/components/ReviewList";
+import WeakQuestionsList from "@/components/WeakQuestionsList";
+import NeetCodeProgressGrid from "@/components/NeetCodeProgressGrid";
+import CompletedReviewCard from "@/components/CompletedReviewCard";
 import { getCurrentUser } from "@/lib/authService";
 import {
+  completeAdaptiveReview,
   getCompletedReviews,
   getDueReviews,
   getUpcomingReviews,
-  markReviewCompleted,
+  getWeakQuestions,
+  reopenReview,
 } from "@/lib/reviewService";
+import { getNeetCodeGrid } from "@/lib/neetcodeService";
 import {
   requestNotificationPermission,
   showReviewNotification,
 } from "@/lib/notifications";
-import type { ReviewWithTopic } from "@/types";
-
-interface DashboardState {
-  due: ReviewWithTopic[];
-  upcoming: ReviewWithTopic[];
-  completed: ReviewWithTopic[];
-}
+import type {
+  CompletedReview,
+  NeetCodeGridCell,
+  Rating,
+  ReviewItem,
+} from "@/types";
 
 const REFRESH_INTERVAL_MS = 60_000;
+
+interface DashboardState {
+  due: ReviewItem[];
+  upcoming: ReviewItem[];
+  weak: ReviewItem[];
+  grid: NeetCodeGridCell[];
+  completed: CompletedReview[];
+}
+
+const EMPTY: DashboardState = {
+  due: [],
+  upcoming: [],
+  weak: [],
+  grid: [],
+  completed: [],
+};
 
 export default function DashboardPage() {
   const router = useRouter();
   const [userId, setUserId] = useState<string | null>(null);
-  const [state, setState] = useState<DashboardState>({
-    due: [],
-    upcoming: [],
-    completed: [],
-  });
+  const [state, setState] = useState<DashboardState>(EMPTY);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const loadReviews = useCallback(
-    async (uid: string, options?: { silent?: boolean }) => {
-      if (!options?.silent) setRefreshing(true);
-      try {
-        const [dueRes, upcomingRes, completedRes] = await Promise.all([
+  const load = useCallback(async (uid: string, opts?: { silent?: boolean }) => {
+    if (!opts?.silent) setRefreshing(true);
+    try {
+      const [dueRes, upcomingRes, weakRes, gridRes, completedRes] =
+        await Promise.all([
           getDueReviews(uid),
-          getUpcomingReviews(uid),
-          getCompletedReviews(uid),
+          getUpcomingReviews(uid, 10),
+          getWeakQuestions(uid, 6),
+          getNeetCodeGrid(uid),
+          getCompletedReviews(uid, 5),
         ]);
-        if (dueRes.error) throw new Error(dueRes.error);
-        if (upcomingRes.error) throw new Error(upcomingRes.error);
-        if (completedRes.error) throw new Error(completedRes.error);
 
-        const due = dueRes.data ?? [];
-        setState({
-          due,
-          upcoming: upcomingRes.data ?? [],
-          completed: completedRes.data ?? [],
-        });
+      const firstError =
+        dueRes.error ||
+        upcomingRes.error ||
+        weakRes.error ||
+        gridRes.error ||
+        completedRes.error;
+      if (firstError) throw new Error(firstError);
 
-        for (const review of due) {
-          showReviewNotification(review);
-        }
-      } catch (err) {
-        const message =
-          err instanceof Error ? err.message : "Could not load reviews";
-        setError(message);
-      } finally {
-        setRefreshing(false);
-      }
-    },
-    [],
-  );
+      const due = dueRes.data ?? [];
+      setState({
+        due,
+        upcoming: upcomingRes.data ?? [],
+        weak: weakRes.data ?? [],
+        grid: gridRes.data ?? [],
+        completed: completedRes.data ?? [],
+      });
+      for (const item of due) showReviewNotification(item);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not load dashboard");
+    } finally {
+      setRefreshing(false);
+    }
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -83,53 +103,45 @@ export default function DashboardPage() {
       const uid = userRes.data.id;
       setUserId(uid);
       await requestNotificationPermission();
-      await loadReviews(uid);
+      await load(uid);
       setLoading(false);
     })();
     return () => {
       active = false;
     };
-  }, [router, loadReviews]);
+  }, [router, load]);
 
   useEffect(() => {
     if (!userId) return;
     const interval = window.setInterval(() => {
-      loadReviews(userId, { silent: true });
+      load(userId, { silent: true });
     }, REFRESH_INTERVAL_MS);
     return () => window.clearInterval(interval);
-  }, [userId, loadReviews]);
+  }, [userId, load]);
 
-  const handleComplete = useCallback(
-    async (reviewId: string) => {
+  const handleRate = useCallback(
+    async (item: ReviewItem, rating: Rating) => {
       if (!userId) return;
-      const previous = state;
-      const completedReview = previous.due.find((r) => r.id === reviewId);
-      setState((prev) => ({
-        due: prev.due.filter((r) => r.id !== reviewId),
-        upcoming: prev.upcoming,
-        completed: completedReview
-          ? [
-              {
-                ...completedReview,
-                completed: true,
-                completed_at: new Date().toISOString(),
-              },
-              ...prev.completed,
-            ]
-          : prev.completed,
-      }));
-
-      const { error: serviceError } = await markReviewCompleted(
+      const { error: e } = await completeAdaptiveReview(
         userId,
-        reviewId,
+        item.item_type,
+        item.id,
+        rating,
       );
-      if (serviceError) {
-        setState(previous);
-        setError(serviceError);
-        throw new Error(serviceError);
-      }
+      if (e) throw new Error(e);
+      await load(userId, { silent: true });
     },
-    [state, userId],
+    [userId, load],
+  );
+
+  const handleReopen = useCallback(
+    async (review: CompletedReview) => {
+      if (!userId || !review.topic_id) return;
+      const { error: e } = await reopenReview(userId, "topic", review.topic_id);
+      if (e) throw new Error(e);
+      await load(userId, { silent: true });
+    },
+    [userId, load],
   );
 
   return (
@@ -140,7 +152,7 @@ export default function DashboardPage() {
           <div>
             <h1 className="text-2xl font-semibold tracking-tight">Dashboard</h1>
             <p className="text-sm text-zinc-500 dark:text-zinc-400">
-              Your spaced-repetition queue.
+              Your adaptive study queue.
             </p>
           </div>
           {refreshing ? (
@@ -161,31 +173,62 @@ export default function DashboardPage() {
 
         {loading ? (
           <p className="text-sm text-zinc-500 dark:text-zinc-400">
-            Loading your reviews…
+            Loading your dashboard…
           </p>
         ) : (
           <div className="space-y-10">
             <ReviewList
               title="Due now"
-              description="Review these before they pile up."
-              reviews={state.due}
+              description="Rate each item to schedule its next review."
+              items={state.due}
               variant="due"
               emptyMessage="Nothing due right now. Nice work!"
-              onComplete={handleComplete}
+              onRate={handleRate}
             />
+
             <ReviewList
-              title="Upcoming"
+              title="Upcoming reviews"
               description="Scheduled but not yet due."
-              reviews={state.upcoming}
+              items={state.upcoming}
               variant="upcoming"
-              emptyMessage="Add a topic to start scheduling reviews."
+              emptyMessage="Add a topic or review a NeetCode question to schedule reviews."
             />
-            <ReviewList
-              title="Recently completed"
-              reviews={state.completed}
-              variant="completed"
-              emptyMessage="Completed reviews will appear here."
-            />
+
+            <NeetCodeProgressGrid cells={state.grid} />
+
+            <WeakQuestionsList items={state.weak} onRate={handleRate} />
+
+            <div className="space-y-3">
+              <div className="flex items-end justify-between">
+                <h2 className="text-lg font-semibold text-zinc-900 dark:text-zinc-50">
+                  Recently completed
+                  <span className="ml-2 text-sm font-normal text-zinc-500 dark:text-zinc-400">
+                    (latest {state.completed.length})
+                  </span>
+                </h2>
+                <Link
+                  href="/completed"
+                  className="text-sm font-medium text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-50"
+                >
+                  View all completed reviews →
+                </Link>
+              </div>
+              {state.completed.length === 0 ? (
+                <div className="rounded-lg border border-dashed border-zinc-300 bg-white/50 p-6 text-sm text-zinc-500 dark:border-zinc-700 dark:bg-zinc-900/40 dark:text-zinc-400">
+                  Completed reviews will appear here.
+                </div>
+              ) : (
+                <div className="grid gap-3 sm:grid-cols-2">
+                  {state.completed.map((review) => (
+                    <CompletedReviewCard
+                      key={review.id}
+                      review={review}
+                      onReopen={handleReopen}
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
         )}
       </main>

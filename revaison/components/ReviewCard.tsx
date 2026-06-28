@@ -1,86 +1,110 @@
 "use client";
 
-import { useState } from "react";
+import type { ReactNode } from "react";
 import Link from "next/link";
-import { format, formatDistanceToNowStrict, isPast } from "date-fns";
-import type { ReviewWithTopic } from "@/types";
+import type { Difficulty, ItemStatus } from "@/types";
 
-interface ReviewCardProps {
-  review: ReviewWithTopic;
-  onComplete?: (reviewId: string) => Promise<void> | void;
-  variant?: "due" | "upcoming" | "completed";
+type Tone = "amber" | "emerald" | "rose" | "sky" | "zinc";
+
+interface Badge {
+  label: string;
+  tone: Tone;
 }
 
+interface ReviewCardProps {
+  title: string;
+  href?: string;
+  /** Small uppercase eyebrow, e.g. category or item type. */
+  eyebrow?: string;
+  /** Free-form secondary line(s) under the title. */
+  meta?: ReactNode;
+  badge?: Badge;
+  difficulty?: Difficulty | null;
+  status?: ItemStatus | null;
+  accent?: Tone;
+  error?: string | null;
+  /** Action area (AdaptiveReviewControls, Reopen button, etc.). */
+  children?: ReactNode;
+}
+
+const BADGE_TONES: Record<Tone, string> = {
+  amber:
+    "bg-amber-100 text-amber-800 dark:bg-amber-950/50 dark:text-amber-300",
+  emerald:
+    "bg-emerald-100 text-emerald-800 dark:bg-emerald-950/50 dark:text-emerald-300",
+  rose: "bg-rose-100 text-rose-800 dark:bg-rose-950/50 dark:text-rose-300",
+  sky: "bg-sky-100 text-sky-800 dark:bg-sky-950/50 dark:text-sky-300",
+  zinc: "bg-zinc-100 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-200",
+};
+
+const ACCENT_BORDERS: Record<Tone, string> = {
+  amber: "border-amber-300 bg-amber-50/50 dark:border-amber-900/50 dark:bg-amber-950/20",
+  emerald:
+    "border-emerald-200 bg-emerald-50/50 dark:border-emerald-900/50 dark:bg-emerald-950/20",
+  rose: "border-rose-300 bg-rose-50/50 dark:border-rose-900/50 dark:bg-rose-950/20",
+  sky: "border-sky-200 bg-sky-50/50 dark:border-sky-900/50 dark:bg-sky-950/20",
+  zinc: "border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900",
+};
+
+const DIFF_TONES: Record<Difficulty, string> = {
+  easy: "text-emerald-600 dark:text-emerald-400",
+  medium: "text-amber-600 dark:text-amber-400",
+  hard: "text-rose-600 dark:text-rose-400",
+};
+
 export default function ReviewCard({
-  review,
-  onComplete,
-  variant = "due",
+  title,
+  href,
+  eyebrow,
+  meta,
+  badge,
+  difficulty,
+  accent = "zinc",
+  error,
+  children,
 }: ReviewCardProps) {
-  const [marking, setMarking] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const reviewDate = new Date(review.review_time);
-  const reviewIsPast = isPast(reviewDate);
-
-  async function handleComplete() {
-    if (!onComplete || marking) return;
-    setError(null);
-    setMarking(true);
-    try {
-      await onComplete(review.id);
-    } catch (err) {
-      const message =
-        err instanceof Error ? err.message : "Could not mark complete";
-      setError(message);
-      setMarking(false);
-    }
-  }
-
-  const accent =
-    variant === "due"
-      ? "border-amber-300 bg-amber-50/60 dark:border-amber-900/50 dark:bg-amber-950/30"
-      : variant === "completed"
-        ? "border-emerald-200 bg-emerald-50/60 dark:border-emerald-900/50 dark:bg-emerald-950/30"
-        : "border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900";
-
   return (
     <article
-      className={`flex flex-col gap-3 rounded-lg border p-4 shadow-sm ${accent}`}
+      className={`flex flex-col gap-3 rounded-lg border p-4 shadow-sm ${ACCENT_BORDERS[accent]}`}
     >
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div className="min-w-0">
-          {review.topic ? (
+          {eyebrow ? (
+            <p className="mb-0.5 text-xs uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
+              {eyebrow}
+            </p>
+          ) : null}
+          {href ? (
             <Link
-              href={`/topic/${review.topic.id}`}
+              href={href}
               className="block truncate text-base font-semibold text-zinc-900 hover:underline dark:text-zinc-50"
-              title={review.topic.title}
+              title={title}
             >
-              {review.topic.title}
+              {title}
             </Link>
           ) : (
-            <span className="block text-base font-semibold text-zinc-900 dark:text-zinc-50">
-              Untitled topic
+            <span className="block truncate text-base font-semibold text-zinc-900 dark:text-zinc-50">
+              {title}
             </span>
           )}
-          <p className="mt-0.5 text-xs uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
-            {review.interval_label} review
-          </p>
+          {difficulty ? (
+            <span className={`text-xs font-medium capitalize ${DIFF_TONES[difficulty]}`}>
+              {difficulty}
+            </span>
+          ) : null}
         </div>
-        <span className="rounded-full bg-zinc-100 px-2.5 py-1 text-xs font-medium text-zinc-700 dark:bg-zinc-800 dark:text-zinc-200">
-          {variant === "completed"
-            ? "Completed"
-            : reviewIsPast
-              ? "Due now"
-              : `In ${formatDistanceToNowStrict(reviewDate)}`}
-        </span>
+        {badge ? (
+          <span
+            className={`shrink-0 rounded-full px-2.5 py-1 text-xs font-medium ${BADGE_TONES[badge.tone]}`}
+          >
+            {badge.label}
+          </span>
+        ) : null}
       </div>
 
-      <p className="text-sm text-zinc-600 dark:text-zinc-300">
-        Scheduled for {format(reviewDate, "PP p")}
-        {variant === "completed" && review.completed_at
-          ? ` · Completed ${format(new Date(review.completed_at), "PP p")}`
-          : ""}
-      </p>
+      {meta ? (
+        <div className="text-sm text-zinc-600 dark:text-zinc-300">{meta}</div>
+      ) : null}
 
       {error ? (
         <p
@@ -91,16 +115,7 @@ export default function ReviewCard({
         </p>
       ) : null}
 
-      {variant !== "completed" && onComplete ? (
-        <button
-          type="button"
-          onClick={handleComplete}
-          disabled={marking}
-          className="self-start rounded-md bg-zinc-900 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-zinc-800 disabled:opacity-50 dark:bg-zinc-50 dark:text-zinc-900 dark:hover:bg-zinc-200"
-        >
-          {marking ? "Marking…" : "Mark complete"}
-        </button>
-      ) : null}
+      {children ? <div>{children}</div> : null}
     </article>
   );
 }

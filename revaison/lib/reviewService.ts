@@ -1,8 +1,13 @@
 import { supabase } from "./supabaseClient";
+import { computeNextReview, isValidRating, nextStatus } from "./reviewSchedule";
 import type {
-  Review,
-  ReviewScheduleItem,
-  ReviewWithTopic,
+  CompletedReview,
+  CompletedReviewFilters,
+  CompletedReviewStats,
+  ItemStatus,
+  Rating,
+  ReviewItem,
+  ReviewItemType,
   ServiceResult,
 } from "@/types";
 
@@ -11,153 +16,376 @@ function requireUserId(userId: string | null | undefined): string | null {
   return null;
 }
 
-export async function createReviews(
+// ── Row → ReviewItem mappers (keep card payloads lightweight) ────────────────
+
+const TOPIC_ITEM_COLS =
+  "id, title, notes, difficulty, status, next_review_at, last_reviewed_at, attempt_count";
+const NEETCODE_ITEM_COLS =
+  "id, question_number, title, category, difficulty, status, notes, next_review_at, last_reviewed_at, attempt_count";
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+function topicToItem(row: any): ReviewItem {
+  return {
+    id: row.id,
+    item_type: "topic",
+    title: row.title,
+    href: `/topic/${row.id}`,
+    category: null,
+    difficulty: row.difficulty ?? null,
+    status: (row.status ?? "learning") as ItemStatus,
+    notes: row.notes ?? null,
+    next_review_at: row.next_review_at ?? null,
+    last_reviewed_at: row.last_reviewed_at ?? null,
+    attempt_count: row.attempt_count ?? 0,
+  };
+}
+
+function neetcodeToItem(row: any): ReviewItem {
+  return {
+    id: row.id,
+    item_type: "neetcode",
+    title: row.title,
+    href: `/neetcode/${row.question_number}`,
+    category: row.category ?? null,
+    difficulty: row.difficulty ?? null,
+    status: (row.status ?? "not_started") as ItemStatus,
+    notes: row.notes ?? null,
+    next_review_at: row.next_review_at ?? null,
+    last_reviewed_at: row.last_reviewed_at ?? null,
+    attempt_count: row.attempt_count ?? 0,
+  };
+}
+/* eslint-enable @typescript-eslint/no-explicit-any */
+
+function byNextReviewAsc(a: ReviewItem, b: ReviewItem): number {
+  const ta = a.next_review_at ? Date.parse(a.next_review_at) : Infinity;
+  const tb = b.next_review_at ? Date.parse(b.next_review_at) : Infinity;
+  return ta - tb;
+}
+
+// ── Adaptive completion ──────────────────────────────────────────────────────
+
+/**
+ * Record a single review. Updates ONLY the main item row's next_review_at /
+ * status / attempt_count, and (for topics) inserts exactly one history row.
+ * Never generates multiple future review rows.
+ */
+export async function completeAdaptiveReview(
   userId: string,
-  topicId: string,
-  scheduleItems: ReviewScheduleItem[],
-): Promise<ServiceResult<Review[]>> {
+  itemType: ReviewItemType,
+  itemId: string,
+  rating: Rating,
+): Promise<
+  ServiceResult<{
+    next_review_at: string;
+    status: ItemStatus;
+    attempt_count: number;
+  }>
+> {
   const idError = requireUserId(userId);
   if (idError) return { data: null, error: idError };
-  if (!topicId) return { data: null, error: "Missing topic id" };
-  if (!Array.isArray(scheduleItems) || scheduleItems.length === 0) {
-    return { data: null, error: "No review schedule provided" };
-  }
+  if (!itemId) return { data: null, error: "Missing item id" };
+  if (!isValidRating(rating)) return { data: null, error: "Invalid rating" };
 
-  const { data: existing, error: existingError } = await supabase
-    .from("reviews")
-    .select("interval_label")
+  const table = itemType === "topic" ? "topics" : "neetcode_questions";
+
+  // Fetch current row (ownership enforced by user_id filter + RLS).
+  const { data: current, error: fetchError } = await supabase
+    .from(table)
+    .select("attempt_count, status")
     .eq("user_id", userId)
-    .eq("topic_id", topicId);
+    .eq("id", itemId)
+    .maybeSingle();
 
-  if (existingError) return { data: null, error: existingError.message };
+  if (fetchError) return { data: null, error: fetchError.message };
+  if (!current) return { data: null, error: "Review item not found" };
 
-  const existingLabels = new Set(
-    (existing ?? []).map((r) => r.interval_label as string),
-  );
+  const now = new Date();
+  const nextReview = computeNextReview(rating, now);
+  const attemptCount = (current.attempt_count ?? 0) + 1;
+  const status = nextStatus(rating, attemptCount);
 
-  const seen = new Set<string>();
-  const rows = scheduleItems
-    .filter((item) => {
-      if (existingLabels.has(item.interval_label)) return false;
-      if (seen.has(item.interval_label)) return false;
-      seen.add(item.interval_label);
-      return true;
+  const { error: updateError } = await supabase
+    .from(table)
+    .update({
+      next_review_at: nextReview.toISOString(),
+      last_reviewed_at: now.toISOString(),
+      attempt_count: attemptCount,
+      status,
     })
-    .map((item) => ({
-      user_id: userId,
-      topic_id: topicId,
-      interval_label: item.interval_label,
-      review_time: item.review_time.toISOString(),
-      completed: false,
-    }));
+    .eq("user_id", userId)
+    .eq("id", itemId);
 
-  if (rows.length === 0) {
-    return { data: [], error: null };
+  if (updateError) return { data: null, error: updateError.message };
+
+  // History row only for topics (review_attempts.topic_id → topics).
+  if (itemType === "topic") {
+    const { error: historyError } = await supabase
+      .from("review_attempts")
+      .insert({
+        user_id: userId,
+        topic_id: itemId,
+        rating,
+        reviewed_at: now.toISOString(),
+        next_review_at: nextReview.toISOString(),
+      });
+    if (historyError) return { data: null, error: historyError.message };
   }
 
-  const { data, error } = await supabase
-    .from("reviews")
-    .insert(rows)
-    .select("*");
-
-  if (error) return { data: null, error: error.message };
-  return { data: (data ?? []) as Review[], error: null };
+  return {
+    data: {
+      next_review_at: nextReview.toISOString(),
+      status,
+      attempt_count: attemptCount,
+    },
+    error: null,
+  };
 }
+
+// ── Dashboard queries (lightweight, server-filtered) ─────────────────────────
 
 export async function getDueReviews(
   userId: string,
-): Promise<ServiceResult<ReviewWithTopic[]>> {
+): Promise<ServiceResult<ReviewItem[]>> {
   const idError = requireUserId(userId);
   if (idError) return { data: null, error: idError };
 
   const nowIso = new Date().toISOString();
-  const { data, error } = await supabase
-    .from("reviews")
-    .select("*, topic:topics(id, title)")
-    .eq("user_id", userId)
-    .eq("completed", false)
-    .lte("review_time", nowIso)
-    .order("review_time", { ascending: true });
 
-  if (error) return { data: null, error: error.message };
-  return { data: (data ?? []) as ReviewWithTopic[], error: null };
+  const [topicRes, neetRes] = await Promise.all([
+    supabase
+      .from("topics")
+      .select(TOPIC_ITEM_COLS)
+      .eq("user_id", userId)
+      .neq("status", "mastered")
+      .lte("next_review_at", nowIso)
+      .order("next_review_at", { ascending: true }),
+    supabase
+      .from("neetcode_questions")
+      .select(NEETCODE_ITEM_COLS)
+      .eq("user_id", userId)
+      .neq("status", "mastered")
+      .lte("next_review_at", nowIso)
+      .order("next_review_at", { ascending: true }),
+  ]);
+
+  if (topicRes.error) return { data: null, error: topicRes.error.message };
+  if (neetRes.error) return { data: null, error: neetRes.error.message };
+
+  const items = [
+    ...(topicRes.data ?? []).map(topicToItem),
+    ...(neetRes.data ?? []).map(neetcodeToItem),
+  ].sort(byNextReviewAsc);
+
+  return { data: items, error: null };
 }
 
 export async function getUpcomingReviews(
   userId: string,
-): Promise<ServiceResult<ReviewWithTopic[]>> {
+  limit = 10,
+): Promise<ServiceResult<ReviewItem[]>> {
   const idError = requireUserId(userId);
   if (idError) return { data: null, error: idError };
 
   const nowIso = new Date().toISOString();
-  const { data, error } = await supabase
-    .from("reviews")
-    .select("*, topic:topics(id, title)")
-    .eq("user_id", userId)
-    .eq("completed", false)
-    .gt("review_time", nowIso)
-    .order("review_time", { ascending: true });
 
-  if (error) return { data: null, error: error.message };
-  return { data: (data ?? []) as ReviewWithTopic[], error: null };
+  const [topicRes, neetRes] = await Promise.all([
+    supabase
+      .from("topics")
+      .select(TOPIC_ITEM_COLS)
+      .eq("user_id", userId)
+      .neq("status", "mastered")
+      .gt("next_review_at", nowIso)
+      .order("next_review_at", { ascending: true })
+      .limit(limit),
+    supabase
+      .from("neetcode_questions")
+      .select(NEETCODE_ITEM_COLS)
+      .eq("user_id", userId)
+      .neq("status", "mastered")
+      .gt("next_review_at", nowIso)
+      .order("next_review_at", { ascending: true })
+      .limit(limit),
+  ]);
+
+  if (topicRes.error) return { data: null, error: topicRes.error.message };
+  if (neetRes.error) return { data: null, error: neetRes.error.message };
+
+  const items = [
+    ...(topicRes.data ?? []).map(topicToItem),
+    ...(neetRes.data ?? []).map(neetcodeToItem),
+  ]
+    .sort(byNextReviewAsc)
+    .slice(0, limit);
+
+  return { data: items, error: null };
 }
 
+export async function getWeakQuestions(
+  userId: string,
+  limit = 10,
+): Promise<ServiceResult<ReviewItem[]>> {
+  const idError = requireUserId(userId);
+  if (idError) return { data: null, error: idError };
+
+  const [topicRes, neetRes] = await Promise.all([
+    supabase
+      .from("topics")
+      .select(TOPIC_ITEM_COLS)
+      .eq("user_id", userId)
+      .eq("status", "weak")
+      .order("attempt_count", { ascending: false })
+      .limit(limit),
+    supabase
+      .from("neetcode_questions")
+      .select(NEETCODE_ITEM_COLS)
+      .eq("user_id", userId)
+      .eq("status", "weak")
+      .order("attempt_count", { ascending: false })
+      .limit(limit),
+  ]);
+
+  if (topicRes.error) return { data: null, error: topicRes.error.message };
+  if (neetRes.error) return { data: null, error: neetRes.error.message };
+
+  const items = [
+    ...(topicRes.data ?? []).map(topicToItem),
+    ...(neetRes.data ?? []).map(neetcodeToItem),
+  ]
+    .sort((a, b) => b.attempt_count - a.attempt_count)
+    .slice(0, limit);
+
+  return { data: items, error: null };
+}
+
+// ── Completed history (review_attempts) ──────────────────────────────────────
+
+const ATTEMPT_COLS =
+  "id, user_id, topic_id, rating, reviewed_at, next_review_at";
+
+/** Latest N completed reviews — dashboard preview. Never fetches all history. */
 export async function getCompletedReviews(
   userId: string,
-): Promise<ServiceResult<ReviewWithTopic[]>> {
+  limit = 5,
+): Promise<ServiceResult<CompletedReview[]>> {
   const idError = requireUserId(userId);
   if (idError) return { data: null, error: idError };
 
   const { data, error } = await supabase
-    .from("reviews")
-    .select("*, topic:topics(id, title)")
+    .from("review_attempts")
+    .select(`${ATTEMPT_COLS}, topic:topics(id, title)`)
     .eq("user_id", userId)
-    .eq("completed", true)
-    .order("completed_at", { ascending: false })
-    .limit(50);
+    .order("reviewed_at", { ascending: false })
+    .limit(limit);
 
   if (error) return { data: null, error: error.message };
-  return { data: (data ?? []) as ReviewWithTopic[], error: null };
+  return { data: (data ?? []) as unknown as CompletedReview[], error: null };
 }
 
-export async function getReviewsForTopic(
+/** Paginated history with DB-level search/filter/sort. */
+export async function getCompletedReviewsPaginated(
   userId: string,
-  topicId: string,
-): Promise<ServiceResult<Review[]>> {
+  page: number,
+  pageSize: number,
+  filters?: CompletedReviewFilters,
+): Promise<ServiceResult<{ reviews: CompletedReview[]; total: number }>> {
   const idError = requireUserId(userId);
   if (idError) return { data: null, error: idError };
-  if (!topicId) return { data: null, error: "Missing topic id" };
 
-  const { data, error } = await supabase
-    .from("reviews")
-    .select("*")
-    .eq("user_id", userId)
-    .eq("topic_id", topicId)
-    .order("review_time", { ascending: true });
+  const trimmedSearch = filters?.search?.trim() ?? "";
+  const hasSearch = trimmedSearch.length > 0;
+  const from = page * pageSize;
+  const to = from + pageSize - 1;
+  const ascending = filters?.sortDirection === "asc";
+
+  const selectClause = hasSearch
+    ? `${ATTEMPT_COLS}, topic:topics!inner(id, title)`
+    : `${ATTEMPT_COLS}, topic:topics(id, title)`;
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let q: any = supabase
+    .from("review_attempts")
+    .select(selectClause, { count: "exact" })
+    .eq("user_id", userId);
+
+  if (filters?.rating) q = q.eq("rating", filters.rating);
+  if (hasSearch) q = q.ilike("topics.title", `%${trimmedSearch}%`);
+
+  const {
+    data,
+    error,
+    count,
+  }: {
+    data: unknown;
+    error: { message: string } | null;
+    count: number | null;
+  } = await q.order("reviewed_at", { ascending }).range(from, to);
 
   if (error) return { data: null, error: error.message };
-  return { data: (data ?? []) as Review[], error: null };
+  return {
+    data: {
+      reviews: (data ?? []) as CompletedReview[],
+      total: count ?? 0,
+    },
+    error: null,
+  };
 }
 
-export async function markReviewCompleted(
+const RATINGS_FOR_STATS: ReadonlyArray<Rating> = [
+  "Easy",
+  "Medium",
+  "Hard",
+  "Again",
+];
+
+export async function getCompletedReviewStats(
   userId: string,
-  reviewId: string,
-): Promise<ServiceResult<Review>> {
+): Promise<ServiceResult<CompletedReviewStats>> {
   const idError = requireUserId(userId);
   if (idError) return { data: null, error: idError };
-  if (!reviewId) return { data: null, error: "Missing review id" };
 
-  const { data, error } = await supabase
-    .from("reviews")
-    .update({
-      completed: true,
-      completed_at: new Date().toISOString(),
-    })
+  const results = await Promise.all(
+    RATINGS_FOR_STATS.map((rating) =>
+      supabase
+        .from("review_attempts")
+        .select("id", { count: "exact", head: true })
+        .eq("user_id", userId)
+        .eq("rating", rating),
+    ),
+  );
+
+  const byRating: Partial<Record<Rating, number>> = {};
+  let total = 0;
+  for (let i = 0; i < RATINGS_FOR_STATS.length; i++) {
+    const { count, error } = results[i];
+    if (error) return { data: null, error: error.message };
+    byRating[RATINGS_FOR_STATS[i]] = count ?? 0;
+    total += count ?? 0;
+  }
+
+  return { data: { total, byRating }, error: null };
+}
+
+/**
+ * "Review again" / reopen: make the item due immediately without deleting
+ * history or creating duplicate rows. Works for topics and NeetCode questions.
+ */
+export async function reopenReview(
+  userId: string,
+  itemType: ReviewItemType,
+  itemId: string,
+): Promise<ServiceResult<true>> {
+  const idError = requireUserId(userId);
+  if (idError) return { data: null, error: idError };
+  if (!itemId) return { data: null, error: "Missing item id" };
+
+  const table = itemType === "topic" ? "topics" : "neetcode_questions";
+  const { error } = await supabase
+    .from(table)
+    .update({ next_review_at: new Date().toISOString(), status: "learning" })
     .eq("user_id", userId)
-    .eq("id", reviewId)
-    .select("*")
-    .single();
+    .eq("id", itemId);
 
   if (error) return { data: null, error: error.message };
-  return { data: data as Review, error: null };
+  return { data: true, error: null };
 }
